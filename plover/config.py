@@ -3,453 +3,400 @@
 
 """Configuration management."""
 
-import ConfigParser
-from ConfigParser import RawConfigParser
+from collections import ChainMap, namedtuple, OrderedDict
+import codecs
+import configparser
+import json
 import os
-import shutil
-from cStringIO import StringIO
-from plover.exception import InvalidConfigurationError
-from plover.machine.registry import machine_registry
-from plover.oslayer.config import ASSETS_DIR, CONFIG_DIR
+import re
 
-SPINNER_FILE = os.path.join(ASSETS_DIR, 'spinner.gif')
+from plover.exception import InvalidConfigurationError
+from plover.machine.keymap import Keymap
+from plover.registry import registry
+from plover.oslayer.config import CONFIG_DIR
+from plover.misc import boolean, expand_path, shorten_path
+from plover import log
+
 
 # Config path.
 CONFIG_FILE = os.path.join(CONFIG_DIR, 'plover.cfg')
 
 # General configuration sections, options and defaults.
 MACHINE_CONFIG_SECTION = 'Machine Configuration'
-MACHINE_TYPE_OPTION = 'machine_type'
-DEFAULT_MACHINE_TYPE = 'NKRO Keyboard'
-MACHINE_AUTO_START_OPTION = 'auto_start'
-DEFAULT_MACHINE_AUTO_START = False
 
-DICTIONARY_CONFIG_SECTION = 'Dictionary Configuration'
-DICTIONARY_FILE_OPTION = 'dictionary_file'
-DEFAULT_DICTIONARY_FILE = os.path.join(CONFIG_DIR, 'dict.json')
+LEGACY_DICTIONARY_CONFIG_SECTION = 'Dictionary Configuration'
 
 LOGGING_CONFIG_SECTION = 'Logging Configuration'
-LOG_FILE_OPTION = 'log_file'
-DEFAULT_LOG_FILE = os.path.join(CONFIG_DIR, 'plover.log')
-ENABLE_STROKE_LOGGING_OPTION = 'enable_stroke_logging'
-DEFAULT_ENABLE_STROKE_LOGGING = True
-ENABLE_TRANSLATION_LOGGING_OPTION = 'enable_translation_logging'
-DEFAULT_ENABLE_TRANSLATION_LOGGING = True
-
-STROKE_DISPLAY_SECTION = 'Stroke Display'
-STROKE_DISPLAY_SHOW_OPTION = 'show'
-DEFAULT_STROKE_DISPLAY_SHOW = False
-STROKE_DISPLAY_ON_TOP_OPTION = 'on_top'
-DEFAULT_STROKE_DISPLAY_ON_TOP = True
-STROKE_DISPLAY_STYLE_OPTION = 'style'
-DEFAULT_STROKE_DISPLAY_STYLE = 'Paper'
-STROKE_DISPLAY_X_OPTION = 'x'
-DEFAULT_STROKE_DISPLAY_X = -1
-STROKE_DISPLAY_Y_OPTION = 'y'
-DEFAULT_STROKE_DISPLAY_Y = -1
-
-SUGGESTIONS_DISPLAY_SECTION = 'Suggestions Display'
-SUGGESTIONS_DISPLAY_SHOW_OPTION = 'show'
-DEFAULT_SUGGESTIONS_DISPLAY_SHOW = False
-SUGGESTIONS_DISPLAY_ON_TOP_OPTION = 'on_top'
-DEFAULT_SUGGESTIONS_DISPLAY_ON_TOP = True
-SUGGESTIONS_DISPLAY_X_OPTION = 'x'
-DEFAULT_SUGGESTIONS_DISPLAY_X = -1
-SUGGESTIONS_DISPLAY_Y_OPTION = 'y'
-DEFAULT_SUGGESTIONS_DISPLAY_Y = -1
 
 OUTPUT_CONFIG_SECTION = 'Output Configuration'
-OUTPUT_CONFIG_SPACE_PLACEMENT_OPTION = 'space_placement'
-DEFAULT_OUTPUT_CONFIG_SPACE_PLACEMENT = 'Before Output'
+DEFAULT_UNDO_LEVELS = 100
+MINIMUM_UNDO_LEVELS = 1
 
-CONFIG_FRAME_SECTION = 'Config Frame'
-CONFIG_FRAME_X_OPTION = 'x'
-DEFAULT_CONFIG_FRAME_X = -1
-CONFIG_FRAME_Y_OPTION = 'y'
-DEFAULT_CONFIG_FRAME_Y = -1
-CONFIG_FRAME_WIDTH_OPTION = 'width'
-DEFAULT_CONFIG_FRAME_WIDTH = -1
-CONFIG_FRAME_HEIGHT_OPTION = 'height'
-DEFAULT_CONFIG_FRAME_HEIGHT = -1
+DEFAULT_SYSTEM_NAME = 'English Stenotype'
 
-MAIN_FRAME_SECTION = 'Main Frame'
-MAIN_FRAME_X_OPTION = 'x'
-DEFAULT_MAIN_FRAME_X = -1
-MAIN_FRAME_Y_OPTION = 'y'
-DEFAULT_MAIN_FRAME_Y = -1
+SYSTEM_CONFIG_SECTION = 'System: %s'
+SYSTEM_KEYMAP_OPTION = 'keymap[%s]'
 
-TRANSLATION_FRAME_SECTION = 'Translation Frame'
-TRANSLATION_FRAME_X_OPTION = 'x'
-DEFAULT_TRANSLATION_FRAME_X = -1
-TRANSLATION_FRAME_Y_OPTION = 'y'
-DEFAULT_TRANSLATION_FRAME_Y = -1
 
-LOOKUP_FRAME_SECTION = 'Lookup Frame'
-LOOKUP_FRAME_X_OPTION = 'x'
-DEFAULT_LOOKUP_FRAME_X = -1
-LOOKUP_FRAME_Y_OPTION = 'y'
-DEFAULT_LOOKUP_FRAME_Y = -1
+class DictionaryConfig(namedtuple('DictionaryConfig', 'path enabled')):
 
-DICTIONARY_EDITOR_FRAME_SECTION = 'Dictionary Editor Frame'
-DICTIONARY_EDITOR_FRAME_X_OPTION = 'x'
-DEFAULT_DICTIONARY_EDITOR_FRAME_X = -1
-DICTIONARY_EDITOR_FRAME_Y_OPTION = 'y'
-DEFAULT_DICTIONARY_EDITOR_FRAME_Y = -1
+    def __new__(cls, path, enabled=True):
+        return super(DictionaryConfig, cls).__new__(cls, expand_path(path), enabled)
 
-SERIAL_CONFIG_FRAME_SECTION = 'Serial Config Frame'
-SERIAL_CONFIG_FRAME_X_OPTION = 'x'
-DEFAULT_SERIAL_CONFIG_FRAME_X = -1
-SERIAL_CONFIG_FRAME_Y_OPTION = 'y'
-DEFAULT_SERIAL_CONFIG_FRAME_Y = -1
+    @property
+    def short_path(self):
+        return shorten_path(self.path)
 
-KEYBOARD_CONFIG_FRAME_SECTION = 'Keyboard Config Frame'
-KEYBOARD_CONFIG_FRAME_X_OPTION = 'x'
-DEFAULT_KEYBOARD_CONFIG_FRAME_X = -1
-KEYBOARD_CONFIG_FRAME_Y_OPTION = 'y'
-DEFAULT_KEYBOARD_CONFIG_FRAME_Y = -1
+    def to_dict(self):
+        # Note: do not use _asdict because of
+        # https://bugs.python.org/issue24931
+        return {
+            'path': self.short_path,
+            'enabled': self.enabled,
+        }
 
-# Dictionary constants.
-JSON_EXTENSION = '.json'
-RTF_EXTENSION = '.rtf'
+    def replace(self, **kwargs):
+        return self._replace(**kwargs)
 
-# Logging constants.
-LOG_EXTENSION = '.log'
+    @staticmethod
+    def from_dict(d):
+        return DictionaryConfig(**d)
 
-# TODO: Unit test this class
+
+ConfigOption = namedtuple('ConfigOption', '''
+                          name default
+                          getter setter
+                          validate full_key
+                          ''')
+
+class InvalidConfigOption(ValueError):
+
+    def __init__(self, raw_value, fixed_value, message=None):
+        super(InvalidConfigOption, self).__init__(raw_value)
+        self.raw_value = raw_value
+        self.fixed_value = fixed_value
+        self.message = message
+
+    def __str__(self):
+        return self.message or repr(self.raw_value)
+
+
+def raw_option(name, default, section, option, validate):
+    option = option or name
+    def getter(config, key):
+        return config._config[section][option]
+    def setter(config, key, value):
+        config._set(section, option, value)
+    return ConfigOption(name, lambda c, k: default, getter, setter, validate, None)
+
+def json_option(name, default, section, option, validate):
+    option = option or name
+    def getter(config, key):
+        value = config._config[section][option]
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError as e:
+            raise InvalidConfigOption(value, default) from e
+    def setter(config, key, value):
+        if isinstance(value, set):
+            # JSON does not support sets.
+            value = list(sorted(value))
+        config._set(section, option, json.dumps(value, sort_keys=True, ensure_ascii=False))
+    return ConfigOption(name, default, getter, setter, validate, None)
+
+def int_option(name, default, minimum, maximum, section, option=None):
+    option = option or name
+    def getter(config, key):
+        return config._config[section].getint(option)
+    def setter(config, key, value):
+        config._set(section, option, str(value))
+    def validate(config, key, value):
+        if not isinstance(value, int):
+            raise InvalidConfigOption(value, default)
+        if (minimum is not None and value < minimum) or \
+           (maximum is not None and value > maximum):
+            message = '%s not in [%s, %s]' % (value, minimum or '-∞', maximum or '∞')
+            raise InvalidConfigOption(value, default, message)
+        return value
+    return ConfigOption(name, lambda c, k: default, getter, setter, validate, None)
+
+def boolean_option(name, default, section, option=None):
+    option = option or name
+    def getter(config, key):
+        return config._config[section][option]
+    def setter(config, key, value):
+        config._set(section, option, str(value))
+    def validate(config, key, value):
+        try:
+            return boolean(value)
+        except ValueError as e:
+            raise InvalidConfigOption(value, default) from e
+    return ConfigOption(name, lambda c, k: default, getter, setter, validate, None)
+
+def choice_option(name, choices, section, option=None):
+    default = choices[0]
+    def validate(config, key, value):
+        if value not in choices:
+            raise InvalidConfigOption(value, default)
+        return value
+    return raw_option(name, default, section, option, validate)
+
+def plugin_option(name, plugin_type, default, section, option=None):
+    def validate(config, key, value):
+        try:
+            return registry.get_plugin(plugin_type, value).name
+        except KeyError as e:
+            raise InvalidConfigOption(value, default) from e
+    return raw_option(name, default, section, option, validate)
+
+def opacity_option(name, section, option=None):
+    return int_option(name, 100, 0, 100, section, option)
+
+def path_option(name, default, section, option=None):
+    option = option or name
+    def getter(config, key):
+        return expand_path(config._config[section][option])
+    def setter(config, key, value):
+        config._set(section, option, shorten_path(value))
+    def validate(config, key, value):
+        if not isinstance(value, str):
+            raise InvalidConfigOption(value, default)
+        return value
+    return ConfigOption(name, lambda c, k: default, getter, setter, validate, None)
+
+def enabled_extensions_option():
+    def validate(config, key, value):
+        if not isinstance(value, (list, set, tuple)):
+            raise InvalidConfigOption(value, ())
+        return set(value)
+    return json_option('enabled_extensions', lambda c, k: set(), 'Plugins', 'enabled_extensions', validate)
+
+def machine_specific_options():
+    def full_key(config, key):
+        if isinstance(key, tuple):
+            assert len(key) == 2
+            return key
+        return (key, config['machine_type'])
+    def default(config, key):
+        machine_class = registry.get_plugin('machine', key[1]).obj
+        return {
+            name: params[0]
+            for name, params in machine_class.get_option_info().items()
+        }
+    def getter(config, key):
+        return config._config[key[1]]
+    def setter(config, key, value):
+        config._config[key[1]] = value
+    def validate(config, key, raw_options):
+        if not isinstance(raw_options, (dict, configparser.SectionProxy)):
+            raise InvalidConfigOption(raw_options, default(config, key))
+        machine_options = OrderedDict()
+        invalid_options = OrderedDict()
+        machine_class = registry.get_plugin('machine', key[1]).obj
+        for name, params in sorted(machine_class.get_option_info().items()):
+            fallback, convert = params
+            try:
+                raw_value = raw_options[name]
+            except KeyError:
+                value = fallback
+            else:
+                try:
+                    value = convert(raw_value)
+                except ValueError:
+                    invalid_options[name] = raw_value
+                    value = fallback
+            machine_options[name] = value
+        if invalid_options:
+            raise InvalidConfigOption(invalid_options, machine_options)
+        return machine_options
+    return ConfigOption('machine_specific_options', default, getter, setter, validate, full_key)
+
+def system_keymap_option():
+    def full_key(config, key):
+        if isinstance(key, tuple):
+            assert len(key) == 3
+            return key
+        return (key, config['system_name'], config['machine_type'])
+    def location(config, key):
+        return SYSTEM_CONFIG_SECTION % key[1], SYSTEM_KEYMAP_OPTION % key[2]
+    def build_keymap(config, key, mappings=None):
+        system = registry.get_plugin('system', key[1]).obj
+        machine_class = registry.get_plugin('machine', key[2]).obj
+        keymap = Keymap(machine_class.get_keys(), system.KEYS + machine_class.get_actions())
+        if mappings is None:
+            mappings = system.KEYMAPS.get(key[2])
+        if mappings is None:
+            if machine_class.KEYMAP_MACHINE_TYPE is not None:
+                # Try fallback.
+                return build_keymap(config, (key[0], key[1], machine_class.KEYMAP_MACHINE_TYPE))
+            # No fallback...
+            mappings = {}
+        keymap.set_mappings(mappings)
+        return keymap
+    def default(config, key):
+        return build_keymap(config, key)
+    def getter(config, key):
+        section, option = location(config, key)
+        return config._config[section][option]
+    def setter(config, key, keymap):
+        section, option = location(config, key)
+        config._set(section, option, str(keymap))
+    def validate(config, key, value):
+        try:
+            return build_keymap(config, key, value)
+        except ValueError as e:
+            raise InvalidConfigOption(value, default(config, machine_type, system_name)) from e
+    return ConfigOption('system_keymap', default, getter, setter, validate, full_key)
+
+def dictionaries_option():
+    def full_key(config, key):
+        if isinstance(key, tuple):
+            assert len(key) == 2
+            return key
+        return (key, config['system_name'])
+    def location(config, key):
+        return (
+            SYSTEM_CONFIG_SECTION % key[1],
+            'dictionaries',
+        )
+    def default(config, key):
+        system = registry.get_plugin('system', key[1]).obj
+        return [DictionaryConfig(path) for path in system.DEFAULT_DICTIONARIES]
+    def legacy_getter(config):
+        options = config._config[LEGACY_DICTIONARY_CONFIG_SECTION].items()
+        return [
+            {'path': value}
+            for name, value in reversed(sorted(options))
+            if re.match('dictionary_file\d*$', name) is not None
+        ]
+    def getter(config, key):
+        section, option = location(config, key)
+        value = config._config.get(section, option, fallback=None)
+        if value is None:
+            return legacy_getter(config)
+        return json.loads(value)
+    def setter(config, key, dictionaries):
+        section, option = location(config, key)
+        config._set(section, option, json.dumps([
+            d.to_dict() for d in dictionaries
+        ], sort_keys=True))
+        config._config.remove_section(LEGACY_DICTIONARY_CONFIG_SECTION)
+    def validate(config, key, value):
+        dictionaries = []
+        for d in value:
+            if isinstance(d, DictionaryConfig):
+                pass
+            elif isinstance(d, str):
+                d = DictionaryConfig(d)
+            else:
+                d = DictionaryConfig.from_dict(d)
+            dictionaries.append(d)
+        return dictionaries
+    return ConfigOption('dictionaries', default, getter, setter, validate, full_key)
+
 
 class Config(object):
 
     def __init__(self):
-        self._config = RawConfigParser()
+        self._config = None
+        self._cache = {}
         # A convenient place for other code to store a file name.
         self.target_file = None
+        self.clear()
 
     def load(self, fp):
-        self._config = RawConfigParser()
+        self.clear()
+        reader = codecs.getreader('utf8')(fp)
         try:
-            self._config.readfp(fp)
-        except ConfigParser.Error as e:
+            self._config.read_file(reader)
+        except configparser.Error as e:
             raise InvalidConfigurationError(str(e))
 
     def clear(self):
-        self._config = RawConfigParser()
+        self._config = configparser.RawConfigParser()
+        self._cache.clear()
 
     def save(self, fp):
-        self._config.write(fp)
-
-    def clone(self):
-        f = StringIO()
-        self.save(f)
-        c = Config()
-        f.seek(0, 0)
-        c.load(f)
-        return c
-
-    def set_machine_type(self, machine_type):
-        self._set(MACHINE_CONFIG_SECTION, MACHINE_TYPE_OPTION, 
-                         machine_type)
-
-    def get_machine_type(self):
-        return self._get(MACHINE_CONFIG_SECTION, MACHINE_TYPE_OPTION, 
-                         DEFAULT_MACHINE_TYPE)
-
-    def set_machine_specific_options(self, machine_name, options):
-        if self._config.has_section(machine_name):
-            self._config.remove_section(machine_name)
-        self._config.add_section(machine_name)
-        for k, v in options.items():
-            self._config.set(machine_name, k, str(v))
-
-    def get_machine_specific_options(self, machine_name):
-        def convert(p, v):
-            try:
-                return p[1](v)
-            except ValueError:
-                return p[0]
-        machine = machine_registry.get(machine_name)
-        info = machine.get_option_info()
-        defaults = {k: v[0] for k, v in info.items()}
-        if self._config.has_section(machine_name):
-            options = {o: self._config.get(machine_name, o) 
-                       for o in self._config.options(machine_name)
-                       if o in info}
-            options = {k: convert(info[k], v) for k, v in options.items()}
-            defaults.update(options)
-        return defaults
-
-    def set_dictionary_file_names(self, filenames):
-        if self._config.has_section(DICTIONARY_CONFIG_SECTION):
-            self._config.remove_section(DICTIONARY_CONFIG_SECTION)
-        self._config.add_section(DICTIONARY_CONFIG_SECTION)
-        for ordinal, filename in enumerate(filenames, start=1):
-            option = DICTIONARY_FILE_OPTION + str(ordinal)
-            self._config.set(DICTIONARY_CONFIG_SECTION, option, filename)
-
-    def get_dictionary_file_names(self):
-        filenames = []
-        if self._config.has_section(DICTIONARY_CONFIG_SECTION):
-            options = filter(lambda x: x.startswith(DICTIONARY_FILE_OPTION),
-                             self._config.options(DICTIONARY_CONFIG_SECTION))
-            options.sort(key=_dict_entry_key)
-            filenames = [self._config.get(DICTIONARY_CONFIG_SECTION, o) 
-                         for o in options]
-        if not filenames or filenames == ['dict.json']:
-            filenames = [DEFAULT_DICTIONARY_FILE]
-        return filenames
-
-    def set_log_file_name(self, filename):
-        self._set(LOGGING_CONFIG_SECTION, LOG_FILE_OPTION, filename)
-
-    def get_log_file_name(self):
-        return self._get(LOGGING_CONFIG_SECTION, LOG_FILE_OPTION, 
-                         DEFAULT_LOG_FILE)
-
-    def set_enable_stroke_logging(self, log):
-        self._set(LOGGING_CONFIG_SECTION, ENABLE_STROKE_LOGGING_OPTION, log)
-
-    def get_enable_stroke_logging(self):
-        return self._get_bool(LOGGING_CONFIG_SECTION, 
-                              ENABLE_STROKE_LOGGING_OPTION, 
-                              DEFAULT_ENABLE_STROKE_LOGGING)
-
-    def set_enable_translation_logging(self, log):
-      self._set(LOGGING_CONFIG_SECTION, ENABLE_TRANSLATION_LOGGING_OPTION, log)
-
-    def get_enable_translation_logging(self):
-        return self._get_bool(LOGGING_CONFIG_SECTION, 
-                              ENABLE_TRANSLATION_LOGGING_OPTION, 
-                              DEFAULT_ENABLE_TRANSLATION_LOGGING)
-
-    def set_auto_start(self, b):
-        self._set(MACHINE_CONFIG_SECTION, MACHINE_AUTO_START_OPTION, b)
-
-    def get_auto_start(self):
-        return self._get_bool(MACHINE_CONFIG_SECTION, MACHINE_AUTO_START_OPTION, 
-                              DEFAULT_MACHINE_AUTO_START)
-
-    def set_show_stroke_display(self, b):
-        self._set(STROKE_DISPLAY_SECTION, STROKE_DISPLAY_SHOW_OPTION, b)
-
-    def get_show_stroke_display(self):
-        return self._get_bool(STROKE_DISPLAY_SECTION, 
-            STROKE_DISPLAY_SHOW_OPTION, DEFAULT_STROKE_DISPLAY_SHOW)
-
-    def set_show_suggestions_display(self, b):
-        self._set(SUGGESTIONS_DISPLAY_SECTION, SUGGESTIONS_DISPLAY_SHOW_OPTION, b)
-
-    def get_show_suggestions_display(self):
-        return self._get_bool(SUGGESTIONS_DISPLAY_SECTION,
-            SUGGESTIONS_DISPLAY_SHOW_OPTION, DEFAULT_SUGGESTIONS_DISPLAY_SHOW)
-
-    def get_space_placement(self):
-        return self._get(OUTPUT_CONFIG_SECTION, OUTPUT_CONFIG_SPACE_PLACEMENT_OPTION, 
-                         DEFAULT_OUTPUT_CONFIG_SPACE_PLACEMENT)
-
-    def set_space_placement(self, s):
-        self._set(OUTPUT_CONFIG_SECTION, OUTPUT_CONFIG_SPACE_PLACEMENT_OPTION, s)
-
-    def set_stroke_display_on_top(self, b):
-        self._set(STROKE_DISPLAY_SECTION, STROKE_DISPLAY_ON_TOP_OPTION, b)
-
-    def get_stroke_display_on_top(self):
-        return self._get_bool(STROKE_DISPLAY_SECTION, 
-            STROKE_DISPLAY_ON_TOP_OPTION, DEFAULT_STROKE_DISPLAY_ON_TOP)
-
-    def set_suggestions_display_on_top(self, b):
-        self._set(SUGGESTIONS_DISPLAY_SECTION, SUGGESTIONS_DISPLAY_ON_TOP_OPTION, b)
-
-    def get_suggestions_display_on_top(self):
-        return self._get_bool(SUGGESTIONS_DISPLAY_SECTION,
-            SUGGESTIONS_DISPLAY_ON_TOP_OPTION, DEFAULT_SUGGESTIONS_DISPLAY_ON_TOP)
-
-    def set_stroke_display_style(self, s):
-        self._set(STROKE_DISPLAY_SECTION, STROKE_DISPLAY_STYLE_OPTION, s)
-
-    def get_stroke_display_style(self):
-        return self._get(STROKE_DISPLAY_SECTION, STROKE_DISPLAY_STYLE_OPTION, 
-                         DEFAULT_STROKE_DISPLAY_STYLE)
-
-    def set_stroke_display_x(self, x):
-        self._set(STROKE_DISPLAY_SECTION, STROKE_DISPLAY_X_OPTION, x)
-
-    def get_stroke_display_x(self):
-        return self._get_int(STROKE_DISPLAY_SECTION, STROKE_DISPLAY_X_OPTION, 
-                             DEFAULT_STROKE_DISPLAY_X)
-
-    def set_stroke_display_y(self, y):
-        self._set(STROKE_DISPLAY_SECTION, STROKE_DISPLAY_Y_OPTION, y)
-
-    def get_stroke_display_y(self):
-        return self._get_int(STROKE_DISPLAY_SECTION, STROKE_DISPLAY_Y_OPTION, 
-                             DEFAULT_STROKE_DISPLAY_Y)
-
-    def set_suggestions_display_x(self, x):
-        self._set(SUGGESTIONS_DISPLAY_SECTION, SUGGESTIONS_DISPLAY_X_OPTION, x)
-
-    def get_suggestions_display_x(self):
-        return self._get_int(SUGGESTIONS_DISPLAY_SECTION, SUGGESTIONS_DISPLAY_X_OPTION,
-                             DEFAULT_SUGGESTIONS_DISPLAY_X)
-
-    def set_suggestions_display_y(self, y):
-        self._set(SUGGESTIONS_DISPLAY_SECTION, SUGGESTIONS_DISPLAY_Y_OPTION, y)
-
-    def get_suggestions_display_y(self):
-        return self._get_int(SUGGESTIONS_DISPLAY_SECTION, SUGGESTIONS_DISPLAY_Y_OPTION,
-                             DEFAULT_SUGGESTIONS_DISPLAY_Y)
-
-    def set_config_frame_x(self, x):
-        self._set(CONFIG_FRAME_SECTION, CONFIG_FRAME_X_OPTION, x)
-        
-    def get_config_frame_x(self):
-        return self._get_int(CONFIG_FRAME_SECTION, CONFIG_FRAME_X_OPTION,
-                             DEFAULT_CONFIG_FRAME_X)
-
-    def set_config_frame_y(self, y):
-        self._set(CONFIG_FRAME_SECTION, CONFIG_FRAME_Y_OPTION, y)
-    
-    def get_config_frame_y(self):
-        return self._get_int(CONFIG_FRAME_SECTION, CONFIG_FRAME_Y_OPTION,
-                             DEFAULT_CONFIG_FRAME_Y)
-
-    def set_config_frame_width(self, width):
-        self._set(CONFIG_FRAME_SECTION, CONFIG_FRAME_WIDTH_OPTION, width)
-
-    def get_config_frame_width(self):
-        return self._get_int(CONFIG_FRAME_SECTION, CONFIG_FRAME_WIDTH_OPTION,
-                             DEFAULT_CONFIG_FRAME_WIDTH)
-
-    def set_config_frame_height(self, height):
-        self._set(CONFIG_FRAME_SECTION, CONFIG_FRAME_HEIGHT_OPTION, height)
-
-    def get_config_frame_height(self):
-        return self._get_int(CONFIG_FRAME_SECTION, CONFIG_FRAME_HEIGHT_OPTION,
-                             DEFAULT_CONFIG_FRAME_HEIGHT)
-
-    def set_main_frame_x(self, x):
-        self._set(MAIN_FRAME_SECTION, MAIN_FRAME_X_OPTION, x)
-    
-    def get_main_frame_x(self):
-        return self._get_int(MAIN_FRAME_SECTION, MAIN_FRAME_X_OPTION,
-                             DEFAULT_MAIN_FRAME_X)
-
-    def set_main_frame_y(self, y):
-        self._set(MAIN_FRAME_SECTION, MAIN_FRAME_Y_OPTION, y)
-
-    def get_main_frame_y(self):
-        return self._get_int(MAIN_FRAME_SECTION, MAIN_FRAME_Y_OPTION,
-                             DEFAULT_MAIN_FRAME_Y)
-
-    def set_translation_frame_x(self, x):
-        self._set(TRANSLATION_FRAME_SECTION, TRANSLATION_FRAME_X_OPTION, x)
-    
-    def get_translation_frame_x(self):
-        return self._get_int(TRANSLATION_FRAME_SECTION, 
-                             TRANSLATION_FRAME_X_OPTION,
-                             DEFAULT_TRANSLATION_FRAME_X)
-
-    def set_translation_frame_y(self, y):
-        self._set(TRANSLATION_FRAME_SECTION, TRANSLATION_FRAME_Y_OPTION, y)
-
-    def get_translation_frame_y(self):
-        return self._get_int(TRANSLATION_FRAME_SECTION, 
-                             TRANSLATION_FRAME_Y_OPTION,
-                             DEFAULT_TRANSLATION_FRAME_Y)
-                             
-    def set_lookup_frame_x(self, x):
-        self._set(LOOKUP_FRAME_SECTION, LOOKUP_FRAME_X_OPTION, x)
-    
-    def get_lookup_frame_x(self):
-        return self._get_int(LOOKUP_FRAME_SECTION, 
-                             LOOKUP_FRAME_X_OPTION,
-                             DEFAULT_LOOKUP_FRAME_X)
-
-    def set_lookup_frame_y(self, y):
-        self._set(LOOKUP_FRAME_SECTION, LOOKUP_FRAME_Y_OPTION, y)
-
-    def get_lookup_frame_y(self):
-        return self._get_int(LOOKUP_FRAME_SECTION, 
-                             LOOKUP_FRAME_Y_OPTION,
-                             DEFAULT_LOOKUP_FRAME_Y)
-
-    def set_dictionary_editor_frame_x(self, x):
-        self._set(DICTIONARY_EDITOR_FRAME_SECTION, DICTIONARY_EDITOR_FRAME_X_OPTION, x)
-
-    def get_dictionary_editor_frame_x(self):
-        return self._get_int(DICTIONARY_EDITOR_FRAME_SECTION,
-                             DICTIONARY_EDITOR_FRAME_X_OPTION,
-                             DEFAULT_DICTIONARY_EDITOR_FRAME_X)
-
-    def set_dictionary_editor_frame_y(self, y):
-        self._set(DICTIONARY_EDITOR_FRAME_SECTION, DICTIONARY_EDITOR_FRAME_Y_OPTION, y)
-
-    def get_dictionary_editor_frame_y(self):
-        return self._get_int(DICTIONARY_EDITOR_FRAME_SECTION,
-                             DICTIONARY_EDITOR_FRAME_Y_OPTION,
-                             DEFAULT_DICTIONARY_EDITOR_FRAME_Y)
-    
-    def set_serial_config_frame_x(self, x):
-        self._set(SERIAL_CONFIG_FRAME_SECTION, SERIAL_CONFIG_FRAME_X_OPTION, x)
-    
-    def get_serial_config_frame_x(self):
-        return self._get_int(SERIAL_CONFIG_FRAME_SECTION, 
-                             SERIAL_CONFIG_FRAME_X_OPTION,
-                             DEFAULT_SERIAL_CONFIG_FRAME_X)
-
-    def set_serial_config_frame_y(self, y):
-        self._set(SERIAL_CONFIG_FRAME_SECTION, SERIAL_CONFIG_FRAME_Y_OPTION, y)
-
-    def get_serial_config_frame_y(self):
-        return self._get_int(SERIAL_CONFIG_FRAME_SECTION, 
-                             SERIAL_CONFIG_FRAME_Y_OPTION,
-                             DEFAULT_SERIAL_CONFIG_FRAME_Y)
-
-    def set_keyboard_config_frame_x(self, x):
-        self._set(KEYBOARD_CONFIG_FRAME_SECTION, KEYBOARD_CONFIG_FRAME_X_OPTION, 
-                  x)
-    
-    def get_keyboard_config_frame_x(self):
-        return self._get_int(KEYBOARD_CONFIG_FRAME_SECTION, 
-                             KEYBOARD_CONFIG_FRAME_X_OPTION,
-                             DEFAULT_KEYBOARD_CONFIG_FRAME_X)
-
-    def set_keyboard_config_frame_y(self, y):
-        self._set(KEYBOARD_CONFIG_FRAME_SECTION, KEYBOARD_CONFIG_FRAME_Y_OPTION, 
-                  y)
-
-    def get_keyboard_config_frame_y(self):
-        return self._get_int(KEYBOARD_CONFIG_FRAME_SECTION, 
-                             KEYBOARD_CONFIG_FRAME_Y_OPTION,
-                             DEFAULT_KEYBOARD_CONFIG_FRAME_Y)
+        writer = codecs.getwriter('utf8')(fp)
+        self._config.write(writer)
 
     def _set(self, section, option, value):
         if not self._config.has_section(section):
             self._config.add_section(section)
-        self._config.set(section, option, str(value))
+        self._config.set(section, option, value)
 
-    def _get(self, section, option, default):
-        if self._config.has_option(section, option):
-            return self._config.get(section, option)
-        return default
+    # Note: order matters, e.g. machine_type comes before
+    # machine_specific_options and system_keymap because
+    # the latter depend on the former.
+    _OPTIONS = OrderedDict((opt.name, opt) for opt in [
+        # Output.
+        choice_option('space_placement', ('Before Output', 'After Output'), OUTPUT_CONFIG_SECTION),
+        boolean_option('start_attached', False, OUTPUT_CONFIG_SECTION),
+        boolean_option('start_capitalized', False, OUTPUT_CONFIG_SECTION),
+        int_option('undo_levels', DEFAULT_UNDO_LEVELS, MINIMUM_UNDO_LEVELS, None, OUTPUT_CONFIG_SECTION),
+        # Logging.
+        path_option('log_file_name', expand_path('strokes.log'), LOGGING_CONFIG_SECTION, 'log_file'),
+        boolean_option('enable_stroke_logging', False, LOGGING_CONFIG_SECTION),
+        boolean_option('enable_translation_logging', False, LOGGING_CONFIG_SECTION),
+        # GUI.
+        boolean_option('start_minimized', False, 'Startup', 'Start Minimized'),
+        boolean_option('show_stroke_display', False, 'Stroke Display', 'show'),
+        boolean_option('show_suggestions_display', False, 'Suggestions Display', 'show'),
+        opacity_option('translation_frame_opacity', 'Translation Frame', 'opacity'),
+        boolean_option('classic_dictionaries_display_order', False, 'GUI'),
+        # Plugins.
+        enabled_extensions_option(),
+        # Machine.
+        boolean_option('auto_start', False, MACHINE_CONFIG_SECTION),
+        plugin_option('machine_type', 'machine', 'Keyboard', MACHINE_CONFIG_SECTION),
+        machine_specific_options(),
+        # System.
+        plugin_option('system_name', 'system', DEFAULT_SYSTEM_NAME, 'System', 'name'),
+        system_keymap_option(),
+        dictionaries_option(),
+    ])
 
-    def _get_bool(self, section, option, default):
+    def _lookup(self, key):
+        name = key[0] if isinstance(key, tuple) else key
+        opt = self._OPTIONS[name]
+        if opt.full_key is not None:
+            key = opt.full_key(self, key)
+        return key, opt
+
+    def __getitem__(self, key):
+        key, opt = self._lookup(key)
+        if key in self._cache:
+            return self._cache[key]
         try:
-            if self._config.has_option(section, option):
-                return self._config.getboolean(section, option)
-        except ValueError:
-            pass
-        return default
+            value = opt.validate(self, key, opt.getter(self, key))
+        except (configparser.NoOptionError, KeyError):
+            value = opt.default(self, key)
+        except InvalidConfigOption as e:
+            log.error('invalid value for %r option', opt.name, exc_info=True)
+            value = e.fixed_value
+        self._cache[key] = value
+        return value
 
-    def _get_int(self, section, option, default):
-        try:
-            if self._config.has_option(section, option):
-                return self._config.getint(section, option)
-        except ValueError:
-            pass
-        return default
-        
+    def __setitem__(self, key, value):
+        key, opt = self._lookup(key)
+        value = opt.validate(self._config, key, value)
+        opt.setter(self, value, key)
+        self._cache[key] = value
 
-def _dict_entry_key(s):
-    try:
-        return int(s[len(DICTIONARY_FILE_OPTION):])
-    except ValueError:
-        return -1
+    def as_dict(self):
+        return {opt.name: self[opt.name] for opt in self._OPTIONS.values()}
+
+    def update(self, **kwargs):
+        new_settings = []
+        new_config = ChainMap({}, self)
+        for opt in self._OPTIONS.values():
+            if opt.name in kwargs:
+                key = opt.name
+                if opt.full_key is not None:
+                    key = opt.full_key(new_config, key)
+                value = opt.validate(new_config, key, kwargs[opt.name])
+                new_settings.append((opt, key, value))
+                new_config[opt.name] = value
+        for opt, key, value in new_settings:
+            opt.setter(self, key, value)
+            self._cache[key] = value

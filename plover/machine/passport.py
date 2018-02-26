@@ -3,49 +3,29 @@
 
 "Thread-based monitoring of a stenotype machine using the passport protocol."
 
+from itertools import zip_longest
+
 from plover.machine.base import SerialStenotypeBase
-from itertools import izip_longest
 
 # Passport protocol is documented here:
 # http://www.eclipsecat.com/?q=system/files/Passport%20protocol_0.pdf
 
-STENO_KEY_CHART = {
-    '!': None,
-    '#': '#',
-    '^': None,
-    '+': None,
-    'S': 'S-',
-    'C': 'S-',
-    'T': 'T-',
-    'K': 'K-',
-    'P': 'P-',
-    'W': 'W-',
-    'H': 'H-',
-    'R': 'R-',
-    '~': '*',
-    '*': '*',
-    'A': 'A-',
-    'O': 'O-',
-    'E': '-E',
-    'U': '-U',
-    'F': '-F',
-    'Q': '-R',
-    'N': '-P',
-    'B': '-B',
-    'L': '-L',
-    'G': '-G',
-    'Y': '-T',
-    'X': '-S',
-    'D': '-D',
-    'Z': '-Z',
-}
-
-
-class Stenotype(SerialStenotypeBase):
+class Passport(SerialStenotypeBase):
     """Passport interface."""
 
+    KEYS_LAYOUT = '''
+        # # # # # # # # # #
+        S T P H ~ F N L Y D
+        C K W R * Q B G X Z
+            A O   E U
+        ! ^ +
+    '''
+
+    SERIAL_PARAMS = dict(SerialStenotypeBase.SERIAL_PARAMS)
+    SERIAL_PARAMS.update(baudrate=38400)
+
     def __init__(self, params):
-        SerialStenotypeBase.__init__(self, params)
+        super(Passport, self).__init__(params)
         self.packet = []
 
     def _read(self, b):
@@ -57,15 +37,14 @@ class Stenotype(SerialStenotypeBase):
 
     def _handle_packet(self, packet):
         encoded = packet.split('/')[1]
-        keys = []
+        steno_keys = []
         for key, shadow in grouper(encoded, 2, 0):
             shadow = int(shadow, base=16)
             if shadow >= 8:
-                key = STENO_KEY_CHART[key]
-                if key:
-                    keys.append(key)
-        if keys:
-            self._notify(keys)
+                steno_keys.append(key)
+        steno_keys = self.keymap.keys_to_actions(steno_keys)
+        if steno_keys:
+            self._notify(steno_keys)
 
     def run(self):
         """Overrides base class run method. Do not call directly."""
@@ -73,35 +52,14 @@ class Stenotype(SerialStenotypeBase):
 
         while not self.finished.isSet():
             # Grab data from the serial port.
-            raw = self.serial_port.read(self.serial_port.inWaiting())
-
-            # XXX : work around for python 3.1 and python 2.6 differences
-            if isinstance(raw, str):
-                raw = [ord(x) for x in raw]
+            raw = self.serial_port.read(max(1, self.serial_port.inWaiting()))
 
             for b in raw:
                 self._read(b)
-
-    @staticmethod
-    def get_option_info():
-        """Get the default options for this machine."""
-        bool_converter = lambda s: s == 'True'
-        sb = lambda s: int(float(s)) if float(s).is_integer() else float(s)
-        return {
-            'port': (None, str), # TODO: make first port default
-            'baudrate': (38400, int),
-            'bytesize': (8, int),
-            'parity': ('N', str),
-            'stopbits': (1, sb),
-            'timeout': (2.0, float),
-            'xonxoff': (False, bool_converter),
-            'rtscts': (False, bool_converter)
-        }
 
 
 def grouper(iterable, n, fillvalue=None):
     "Collect data into fixed-length chunks or blocks"
     # grouper('ABCDEFG', 3, 'x') --> ABC DEF Gxx
     args = [iter(iterable)] * n
-    return izip_longest(fillvalue=fillvalue, *args)
-
+    return zip_longest(fillvalue=fillvalue, *args)

@@ -8,66 +8,57 @@
 """Common elements to all dictionary formats."""
 
 from os.path import splitext
-import shutil
+import functools
 import threading
 
-import plover.dictionary.json_dict as json_dict
-import plover.dictionary.rtfcre_dict as rtfcre_dict
-from plover.config import JSON_EXTENSION, RTF_EXTENSION, CONFIG_DIR
-from plover.exception import DictionaryLoaderException
+from plover.registry import registry
 
-dictionaries = {
-    JSON_EXTENSION.lower(): json_dict,
-    RTF_EXTENSION.lower(): rtfcre_dict,
-}
 
-def load_dictionary(filename):
-    """Load a dictionary from a file."""
-    extension = splitext(filename)[1].lower()
-    
+def _get_dictionary_class(filename):
+    extension = splitext(filename)[1].lower()[1:]
     try:
-        dict_type = dictionaries[extension]
+        dict_module = registry.get_plugin('dictionary', extension).obj
     except KeyError:
-        raise DictionaryLoaderException(
-            'Unsupported extension for dictionary: %s. Supported extensions: %s' %
-            (extension, ', '.join(dictionaries.keys())))
+        raise ValueError(
+            'Unsupported extension: %s. Supported extensions: %s' %
+            (extension, ', '.join(plugin.name for plugin in
+                                  registry.list_plugins('dictionary'))))
+    return dict_module
 
-    loader = dict_type.load_dictionary
+def _locked(fn):
+    lock = threading.Lock()
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        with lock:
+            fn(*args, **kwargs)
+    return wrapper
 
-    try:
-        with open(filename, 'rb') as f:
-            d = loader(f.read())
-    except IOError as e:
-        raise DictionaryLoaderException(unicode(e))
+def _threaded(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        t = threading.Thread(target=fn, args=args, kwargs=kwargs)
+        t.start()
+    return wrapper
 
-    d.set_path(filename)
-    d.save = ThreadedSaver(d, filename, dict_type.save_dictionary)
+def create_dictionary(resource, threaded_save=True):
+    '''Create a new dictionary.
+
+    The format is inferred from the extension.
+
+    Note: the file is not created! The resulting dictionary save
+    method must be called to finalize the creation on disk.
+    '''
+    d = _get_dictionary_class(resource).create(resource)
+    if threaded_save:
+        d.save = _threaded(_locked(d.save))
     return d
 
-def save_dictionary(d, filename, saver):
-    # Write the new file to a temp location.
-    tmp = filename + '.tmp'
-    with open(tmp, 'wb') as fp:
-        saver(d, fp)
+def load_dictionary(resource, threaded_save=True):
+    '''Load a dictionary from a file.
 
-    # Then move the new file to the final location.
-    shutil.move(tmp, filename)
-    
-class ThreadedSaver(object):
-    """A callable that saves a dictionary in the background.
-    
-    Also makes sure that there is only one active call at a time.
-    """
-    def __init__(self, d, filename, saver):
-        self.d = d
-        self.filename = filename
-        self.saver = saver
-        self.lock = threading.Lock()
-        
-    def __call__(self):
-        t = threading.Thread(target=self.save)
-        t.start()
-        
-    def save(self):
-        with self.lock:
-            save_dictionary(self.d, self.filename, self.saver)
+    The format is inferred from the extension.
+    '''
+    d = _get_dictionary_class(resource).load(resource)
+    if not d.readonly and threaded_save:
+        d.save = _threaded(_locked(d.save))
+    return d

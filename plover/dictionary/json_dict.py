@@ -5,31 +5,37 @@
 
 """
 
-from plover.steno_dictionary import StenoDictionary
-from plover.steno import normalize_steno
-from plover.exception import DictionaryLoaderException
+import codecs
 
 try:
     import simplejson as json
 except ImportError:
     import json
-    
 
-def load_dictionary(data):
-    """Load a json dictionary from a string."""
+from plover.steno_dictionary import StenoDictionary
+from plover.steno import normalize_steno
 
-    def h(pairs):
-        return StenoDictionary((normalize_steno(x[0]), x[1]) for x in pairs)
 
-    try:
-        try:
-            return json.loads(data, object_pairs_hook=h)
-        except UnicodeDecodeError:
-            return json.loads(data, 'latin-1', object_pairs_hook=h)
-    except ValueError:
-        raise DictionaryLoaderException('Dictionary is not valid json.')
-        
-# TODO: test this
-def save_dictionary(d, fp):
-    d = dict(('/'.join(k), v) for k, v in d.iteritems())
-    json.dump(d, fp, sort_keys=True, indent=0, separators=(',', ': '))
+class JsonDictionary(StenoDictionary):
+
+    def _load(self, filename):
+        with open(filename, 'rb') as fp:
+            contents = fp.read()
+        for encoding in ('utf-8', 'latin-1'):
+            try:
+                contents = contents.decode(encoding)
+            except UnicodeDecodeError:
+                continue
+            else:
+                break
+        else:
+            raise ValueError('\'%s\' encoding could not be determined' % (filename,))
+        d = dict(json.loads(contents))
+        self.update((normalize_steno(x[0]), x[1]) for x in d.items())
+
+    def _save(self, filename):
+        with open(filename, 'wb') as fp:
+            writer = codecs.getwriter('utf-8')(fp)
+            json.dump(dict(('/'.join(k), v) for k, v in self.items()),
+                      writer, ensure_ascii=False, sort_keys=True,
+                      indent=0, separators=(',', ': '))

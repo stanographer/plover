@@ -13,12 +13,15 @@ http://www.legalxml.org/workgroups/substantive/transcripts/cre-spec.htm
 
 """
 
+import codecs
 import inspect
 import re
+
 from plover.steno import normalize_steno
 from plover.steno_dictionary import StenoDictionary
-# TODO: Move dictionary format somewhere more caninical than formatting.
+# TODO: Move dictionary format somewhere more canonical than formatting.
 from plover.formatting import META_RE
+
 
 # A regular expression to capture an individual entry in the dictionary.
 DICT_ENTRY_PATTERN = re.compile(r'(?s)(?<!\\){\\\*\\cxs (?P<steno>[^}]+)}' + 
@@ -33,7 +36,7 @@ class TranslationConverter(object):
         self.styles = styles
         
         def linenumber(f):
-            return f[1].im_func.func_code.co_firstlineno
+            return f[1].__code__.co_firstlineno
         
         handler_funcs = inspect.getmembers(self, inspect.ismethod)
         handler_funcs.sort(key=linenumber)
@@ -97,7 +100,6 @@ class TranslationConverter(object):
     def _re_handle_commands(self, m):
         r'(\\\*)?\\([a-z]+)(-?[0-9]+)? ?'
         
-        ignore = bool(m.group(1))
         command = m.group(2)
         arg = m.group(3)
         if arg:
@@ -200,7 +202,6 @@ class TranslationConverter(object):
             return None
         end = len(s)
         depth = 1
-        startpos = pos
         pos += 1
         while pos != end:
             c = s[pos]
@@ -282,55 +283,56 @@ def load_stylesheet(s):
     """Returns a dictionary mapping a number to a style name."""
     return dict((int(k), v) for k, v in STYLESHEET_RE.findall(s))
 
-def load_dictionary(s):
-    """Load an RTF/CRE dictionary."""
-    styles = load_stylesheet(s)
-    d = {}
-    converter = TranslationConverter(styles)
-    for m in DICT_ENTRY_PATTERN.finditer(s):
-        steno = normalize_steno(m.group('steno'))
-        translation = m.group('translation')
-        converted = converter(translation)
-        if converted is not None:
-            d[steno] = converted
-    return StenoDictionary(d)
-
-
 HEADER = ("{\\rtf1\\ansi{\\*\\cxrev100}\\cxdict{\\*\\cxsystem Plover}" +
           "{\\stylesheet{\\s0 Normal;}}\r\n")
 
 def format_translation(t):
     t = ' '.join([x.strip() for x in META_RE.findall(t) if x.strip()])
     
-    t = re.sub(r'{\.}', '{\\cxp. }', t)
-    t = re.sub(r'{!}', '{\\cxp! }', t)
-    t = re.sub(r'{\?}', '{\\cxp? }', t)
-    t = re.sub(r'{\,}', '{\\cxp, }', t)
-    t = re.sub(r'{:}', '{\\cxp: }', t)
-    t = re.sub(r'{;}', '{\\cxp; }', t)
-    t = re.sub(r'{\^}', '\\cxds ', t)
-    t = re.sub(r'{\^([^^}]*)}', '\\cxds \\1', t)
-    t = re.sub(r'{([^^}]*)\^}', '\\1\\cxds ', t)
-    t = re.sub(r'{\^([^^}]*)\^}', '\\cxds \\1\\cxds ', t)
-    t = re.sub(r'{-\|}', '\\cxfc ', t)
-    t = re.sub(r'{>}', '\\cxfls ', t)
-    t = re.sub(r'{ }', ' ', t)
-    t = re.sub(r'{&([^}]+)}', '{\\cxfing \\1}', t)
-    t = re.sub(r'{#([^}]+)}', '\\{#\\1\\}', t)
-    t = re.sub(r'{PLOVER:([a-zA-Z]+)}', '\\{PLOVER:\\1\\}', t)
-    t = re.sub(r'\\"', '"', t)
-    
+    t = re.sub(r'{\.}', r'{\\cxp. }', t)
+    t = re.sub(r'{!}', r'{\\cxp! }', t)
+    t = re.sub(r'{\?}', r'{\\cxp? }', t)
+    t = re.sub(r'{\,}', r'{\\cxp, }', t)
+    t = re.sub(r'{:}', r'{\\cxp: }', t)
+    t = re.sub(r'{;}', r'{\\cxp; }', t)
+    t = re.sub(r'{\^}', r'\\cxds ', t)
+    t = re.sub(r'{\^([^^}]*)}', r'\\cxds \1', t)
+    t = re.sub(r'{([^^}]*)\^}', r'\1\\cxds ', t)
+    t = re.sub(r'{\^([^^}]*)\^}', r'\\cxds \1\\cxds ', t)
+    t = re.sub(r'{-\|}', r'\\cxfc ', t)
+    t = re.sub(r'{>}', r'\\cxfls ', t)
+    t = re.sub(r'{ }', r' ', t)
+    t = re.sub(r'{&([^}]+)}', r'{\\cxfing \1}', t)
+    t = re.sub(r'{#([^}]+)}', r'\\{#\1\\}', t)
+    t = re.sub(r'{PLOVER:([a-zA-Z]+)}', r'\\{PLOVER:\1\\}', t)
+    t = re.sub(r'\\"', r'"', t)
+
     return t
-    
 
-# TODO: test this
-def save_dictionary(d, fp):
-    fp.write(HEADER)
 
-    for s, t in d.items():
-        s = '/'.join(s)
-        t = format_translation(t)
-        entry = "{\\*\\cxs %s}%s\r\n" % (s, t)
-        fp.write(entry)
+class RtfDictionary(StenoDictionary):
 
-    fp.write("}\r\n")
+    def _load(self, filename):
+        with open(filename, 'rb') as fp:
+            s = fp.read().decode('cp1252')
+        def parse():
+            styles = load_stylesheet(s)
+            converter = TranslationConverter(styles)
+            for m in DICT_ENTRY_PATTERN.finditer(s):
+                steno = normalize_steno(m.group('steno'))
+                translation = m.group('translation')
+                converted = converter(translation)
+                if converted is not None:
+                    yield steno, converted
+        self.update(parse())
+
+    def _save(self, filename):
+        with open(filename, 'wb') as fp:
+            writer = codecs.getwriter('cp1252')(fp)
+            writer.write(HEADER)
+            for s, t in self.items():
+                s = '/'.join(s)
+                t = format_translation(t)
+                entry = "{\\*\\cxs %s}%s\r\n" % (s, t)
+                writer.write(entry)
+            writer.write("}\r\n")
