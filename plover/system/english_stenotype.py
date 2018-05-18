@@ -30,7 +30,12 @@ NUMBERS = {
 UNDO_STROKE_STENO = '*'
 
 ORTHOGRAPHY_RULES = [
- # category +s = categories
+
+    # == -sis + -s ==
+    # analysis + ^s = analysis
+    (r'^(.+)sis \^ s$', r'\1ses'),
+
+    # category +s = categories
     (r'^(.+[bcdfghjklmnpqrstvwxz])y \^ s$', r'\1ies'),
 
     # == +ation ==
@@ -50,7 +55,8 @@ ORTHOGRAPHY_RULES = [
     (r'^(.*[aeiou])ple \^ ly$', r'\1ply'),
 
     # politic +ize = politicize
-    (r'^(.*[aeiou]c) \^ iz(e|ed|es|ing|er|ers)$', r'\1iz\2'),
+    (r'^(.*[aeiou]c) \^ iz(e|ed|es|ing|er|ers|ation|ations)$', r'\1iz\2'),
+    (r'^(.*[aeiou]c) \^ is(e|ed|es|ing|er|ers|ation|ations)$', r'\1is\2'),
 
     # == +ry ==
     # statute + ry = statutory
@@ -173,6 +179,9 @@ ORTHOGRAPHY_RULES = [
     (r'^(.+)en \^ iz(e|es|ing|ed|er|ers|ation|ations)$', r'\1eniz\2'),
     (r'^(.+)en \^ is(e|es|ing|ed|er|ers|ation|ations)$', r'\1enis\2'),
 
+    (r'^(.+)y \^ iz(e|es|ing|ed|er|ers|ation|ations|able|ability)$', r'\1iz\2'),
+    (r'^(.+)y \^ is(e|es|ing|ed|er|ers|ation|ations|able|ability)$', r'\1is\2'),
+
     # conditional +ize = conditionalize (*conditionallize)
     (r'^(.+)al \^ iz(e|ed|es|ing|er|ers|ation|ations|m|ms|able|ability|abilities)$', r'\1aliz\2'),
     (r'^(.+)al \^ is(e|ed|es|ing|er|ers|ation|ations|m|ms|able|ability|abilities)$', r'\1alis\2'),
@@ -203,6 +212,7 @@ ORTHOGRAPHY_RULES = [
     (r'^(.+)(ar|er|or) \^ ish$', r'\1\2ish'),
 
     # == misc ==
+
     # defer + ed = deferred (consonant doubling)   XXX monitor(stress not on last syllable)
     (r'^(.*(?:[bcdfghjklmnprstvwxyz]|qu)[aeiou])([bcdfgklmnprtvz]) \^ ([aeiouy].*)$', r'\1\2\2\3'),
 ]
